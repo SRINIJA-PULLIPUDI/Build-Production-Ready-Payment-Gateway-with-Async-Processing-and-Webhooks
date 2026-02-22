@@ -8,15 +8,13 @@ const {
   cardNetwork,
   isExpired
 } = require("../services/validationService");
-const {
-  decideOutcome,
-  processingDelay
-} = require("../services/paymentService");
+const { enqueuePaymentJob } = require("../services/queueService");
+const idempotencyMiddleware = require("../middleware/idempotency");
 
 const router = express.Router();
 
 /* POST /api/v1/payments */
-router.post("/", async (req, res) => {
+router.post("/", idempotencyMiddleware, async (req, res) => {
   try {
     const { order_id, method, vpa, card } = req.body;
 
@@ -41,7 +39,8 @@ router.post("/", async (req, res) => {
     let cardNet = null;
     let last4 = null;
 
-    // UPI VALIDATION 
+    /* ---------------- VALIDATION ---------------- */
+
     if (method === "upi") {
       if (!isValidVPA(vpa)) {
         return res
@@ -50,7 +49,6 @@ router.post("/", async (req, res) => {
       }
     }
 
-    // CARD VALIDATION
     if (method === "card") {
       const { number, exp_month, exp_year, cvv } = card || {};
 
@@ -70,12 +68,13 @@ router.post("/", async (req, res) => {
       last4 = number.slice(-4);
     }
 
-    // CREATE PAYMENT (processing)
+    /* ---------------- CREATE PAYMENT ---------------- */
+
     await pool.query(
       `
       INSERT INTO payments
-      (id, order_id, merchant_id, amount, currency, method, status, vpa, card_network, card_last4, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,'processing',$7,$8,$9,NOW(),NOW())
+      (id, order_id, merchant_id, amount, currency, method, status, error_code, vpa, card_network, card_last4, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,'processing',NULL,$7,$8,$9, NOW(), NOW())
       `,
       [
         paymentId,
@@ -90,45 +89,24 @@ router.post("/", async (req, res) => {
       ]
     );
 
-    // ASYNC PAYMENT RESOLUTION
-    setTimeout(async () => {
-      try {
-        const result = decideOutcome(method);
+    /* ---------------- ASYNC PROCESSING ---------------- */
 
-        await pool.query(
-          `
-          UPDATE payments
-          SET status=$1,
-              error_code=$2,
-              updated_at=NOW()
-          WHERE id=$3
-          `,
-          [result.status, result.reason || null, paymentId]
-        );
+    await enqueuePaymentJob({
+      paymentId,
+      method,
+      merchantId: req.merchant.id
+    });
 
-        // WEBHOOK (OPTIONAL)
-        if (process.env.WEBHOOK_URL) {
-          await fetch(process.env.WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              payment_id: paymentId,
-              status: result.status,
-              reason: result.reason || null
-            })
-          });
-        }
-
-      } catch (err) {
-        console.error("ASYNC PAYMENT ERROR:", err);
-      }
-    }, processingDelay());
-
-    // RESPONSE
-    return res.status(201).json({
+    const response = {
       id: paymentId,
       status: "processing"
-    });
+    };
+
+    if (req.idempotencyKey) {
+      await req.saveIdempotentResponse(response);
+    }
+
+    return res.status(201).json(response);
 
   } catch (err) {
     console.error("PAYMENT ERROR:", err);
@@ -136,6 +114,33 @@ router.post("/", async (req, res) => {
       .status(500)
       .json(errorResponse("PAYMENT_FAILED", "Payment processing failed"));
   }
+});
+
+/* POST /api/v1/payments/:id/capture */
+router.post("/:id/capture", async (req, res) => {
+  const { id } = req.params;
+
+  const payment = await pool.query(
+    "SELECT * FROM payments WHERE id=$1 AND merchant_id=$2",
+    [id, req.merchant.id]
+  );
+
+  if (payment.rowCount === 0) {
+    return res.status(404).json(errorResponse("NOT_FOUND_ERROR", "Payment not found"));
+  }
+
+  if (payment.rows[0].status !== "success") {
+    return res
+      .status(400)
+      .json(errorResponse("BAD_REQUEST_ERROR", "Payment not in capturable state"));
+  }
+
+  await pool.query(
+    "UPDATE payments SET captured=true, updated_at=NOW() WHERE id=$1",
+    [id]
+  );
+
+  return res.json({ id, status: "success", captured: true });
 });
 
 /* GET /api/v1/payments */
@@ -152,14 +157,12 @@ router.get("/:payment_id", async (req, res) => {
   const { payment_id } = req.params;
 
   const result = await pool.query(
-    "SELECT * FROM payments WHERE id=$1",
-    [payment_id]
+    "SELECT * FROM payments WHERE id=$1 AND merchant_id=$2",
+    [payment_id, req.merchant.id]
   );
 
   if (result.rowCount === 0) {
-    return res
-      .status(404)
-      .json(errorResponse("NOT_FOUND_ERROR", "Payment not found"));
+    return res.status(404).json(errorResponse("NOT_FOUND_ERROR", "Payment not found"));
   }
 
   res.json(result.rows[0]);

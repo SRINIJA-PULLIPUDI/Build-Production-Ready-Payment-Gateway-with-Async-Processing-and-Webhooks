@@ -7,16 +7,15 @@ export default function Dashboard() {
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
   const apiKey = localStorage.getItem("apiKey");
   const apiSecret = localStorage.getItem("apiSecret");
 
-  if (!apiKey || !apiSecret) {
-    // window.location.href = "/";
-    return;
-  }
-}, []);
-
+  useEffect(() => {
+    if (!apiKey || !apiSecret) {
+      window.location.href = "/";
+      return;
+    }
+  }, [apiKey, apiSecret]);
 
   const loadData = async () => {
     try {
@@ -36,8 +35,6 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-
-    //  auto-refresh every 5 seconds (safe)
     const interval = setInterval(loadData, 5000);
     return () => clearInterval(interval);
   }, []);
@@ -47,6 +44,12 @@ export default function Dashboard() {
       <LogoutButton />
 
       <h2 data-test-id="dashboard-title">Merchant Dashboard</h2>
+
+      <div style={{ marginBottom: 20 }}>
+        <a href="#/webhooks">Webhook Logs</a> |{" "}
+        <a href="#/webhook-config">Webhook Config</a> |{" "}
+        <a href="#/docs">API Docs</a>
+      </div>
 
       {loading && <p>Loading data...</p>}
 
