@@ -3,7 +3,6 @@ const crypto = require('crypto');
 
 const app = express();
 
-// ⚠️ IMPORTANT: Capture raw body for signature verification
 app.use(
   express.json({
     verify: (req, res, buf) => {
@@ -16,7 +15,7 @@ app.post('/webhook', (req, res) => {
   const signature = req.headers['x-webhook-signature'];
   const rawBody = req.rawBody;
 
-  const secret = 'whsec_test_abc123'; // match your DB webhook_secret
+  const secret = 'whsec_test_abc123'; 
 
   const expectedSignature = crypto
     .createHmac('sha256', secret)
